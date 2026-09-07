@@ -21,6 +21,40 @@
 
 static struct prng_rand_t g_prng_rand_state;
 
+#if NCNN_VULKAN
+static ncnn::PipelineCache* g_gpu_layer_pipeline_cache = 0;
+
+static void destroy_gpu_layer_pipeline_cache()
+{
+    delete g_gpu_layer_pipeline_cache;
+    g_gpu_layer_pipeline_cache = 0;
+}
+
+static ncnn::PipelineCache* get_gpu_layer_pipeline_cache()
+{
+    if (!g_gpu_layer_pipeline_cache)
+    {
+        ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device();
+        g_gpu_layer_pipeline_cache = new ncnn::PipelineCache(vkdev);
+        atexit(destroy_gpu_layer_pipeline_cache);
+    }
+
+    return g_gpu_layer_pipeline_cache;
+}
+
+static void clear_gpu_layer_pipeline_cache_if_needed()
+{
+    if (!g_gpu_layer_pipeline_cache)
+        return;
+
+    const size_t pipeline_cache_limit = 64;
+    if (g_gpu_layer_pipeline_cache->size() < pipeline_cache_limit)
+        return;
+
+    g_gpu_layer_pipeline_cache->clear();
+}
+#endif // NCNN_VULKAN
+
 void SRAND(int seed)
 {
     prng_srand(seed, &g_prng_rand_state);
@@ -215,29 +249,36 @@ int Compare(const ncnn::Mat& a, const ncnn::Mat& b, float epsilon)
     CHECK_MEMBER(h)
     CHECK_MEMBER(d)
     CHECK_MEMBER(c)
+    CHECK_MEMBER(n)
     CHECK_MEMBER(elemsize)
     CHECK_MEMBER(elempack)
 
 #undef CHECK_MEMBER
 
-    for (int q = 0; q < a.c; q++)
+    for (int n = 0; n < a.n; n++)
     {
-        const ncnn::Mat ma = a.channel(q);
-        const ncnn::Mat mb = b.channel(q);
-        for (int z = 0; z < a.d; z++)
+        const ncnn::Mat ba = a.batch(n);
+        const ncnn::Mat bb = b.batch(n);
+
+        for (int q = 0; q < a.c; q++)
         {
-            const ncnn::Mat da = ma.depth(z);
-            const ncnn::Mat db = mb.depth(z);
-            for (int i = 0; i < a.h; i++)
+            const ncnn::Mat ma = ba.channel(q);
+            const ncnn::Mat mb = bb.channel(q);
+            for (int z = 0; z < a.d; z++)
             {
-                const float* pa = da.row(i);
-                const float* pb = db.row(i);
-                for (int j = 0; j < a.w; j++)
+                const ncnn::Mat da = ma.depth(z);
+                const ncnn::Mat db = mb.depth(z);
+                for (int i = 0; i < a.h; i++)
                 {
-                    if (!NearlyEqual(pa[j], pb[j], epsilon))
+                    const float* pa = da.row(i);
+                    const float* pb = db.row(i);
+                    for (int j = 0; j < a.w; j++)
                     {
-                        fprintf(stderr, "value not match  at c:%d d:%d h:%d w:%d    expect %f but got %f\n", q, z, i, j, pa[j], pb[j]);
-                        return -1;
+                        if (!NearlyEqual(pa[j], pb[j], epsilon))
+                        {
+                            fprintf(stderr, "value not match  at n:%d c:%d d:%d h:%d w:%d    expect %f but got %f\n", n, q, z, i, j, pa[j], pb[j]);
+                            return -1;
+                        }
                     }
                 }
             }
@@ -391,6 +432,11 @@ static int convert_to_optimal_layout(const ncnn::Mat& a, ncnn::Mat& a4, ncnn::Ma
             const int packn = ncnn::cpu_riscv_vlenb() / 4;
             if (elemcount % packn == 0)
                 dst_elempack = packn;
+#elif NCNN_LASX
+            if (elemcount % 8 == 0 && ncnn::cpu_support_loongarch_lasx())
+                dst_elempack = 8;
+            else if (elemcount % 4 == 0)
+                dst_elempack = 4;
 #else
             if (elemcount % 4 == 0)
                 dst_elempack = 4;
@@ -403,10 +449,39 @@ static int convert_to_optimal_layout(const ncnn::Mat& a, ncnn::Mat& a4, ncnn::Ma
                 dst_elempack = 8;
             else if (elemcount % 4 == 0)
                 dst_elempack = 4;
+#elif NCNN_AVX512
+            if (elemcount % 16 == 0 && ncnn::cpu_support_x86_avx512())
+                dst_elempack = 16;
+            else if (elemcount % 8 == 0 && ncnn::cpu_support_x86_avx())
+                dst_elempack = 8;
+            else if (elemcount % 4 == 0)
+                dst_elempack = 4;
+#elif NCNN_AVX
+            if (elemcount % 8 == 0 && ncnn::cpu_support_x86_avx())
+                dst_elempack = 8;
+            else if (elemcount % 4 == 0)
+                dst_elempack = 4;
 #elif NCNN_RVV || NCNN_XTHEADVECTOR
             const int packn = ncnn::cpu_riscv_vlenb() / 2;
             if (elemcount % packn == 0)
                 dst_elempack = packn;
+#elif NCNN_LASX
+            if (elemcount % 8 == 0 && ncnn::cpu_support_loongarch_lasx() && opt.use_bf16_storage && op->support_bf16_storage)
+                dst_elempack = 8;
+            else if (elemcount % 8 == 0 && ncnn::cpu_support_loongarch_lsx() && opt.use_bf16_storage && op->support_bf16_storage)
+                dst_elempack = 8;
+            else if (elemcount % 4 == 0)
+                dst_elempack = 4;
+#elif NCNN_LSX
+            if (elemcount % 8 == 0 && ncnn::cpu_support_loongarch_lsx() && opt.use_bf16_storage && op->support_bf16_storage)
+                dst_elempack = 8;
+            else if (elemcount % 4 == 0)
+                dst_elempack = 4;
+#elif NCNN_MSA
+            if (elemcount % 8 == 0 && ncnn::cpu_support_mips_msa() && opt.use_bf16_storage && op->support_bf16_storage)
+                dst_elempack = 8;
+            else if (elemcount % 4 == 0)
+                dst_elempack = 4;
 #else
             if (elemcount % 4 == 0)
                 dst_elempack = 4;
@@ -449,6 +524,11 @@ static int convert_to_optimal_layout(const ncnn::Mat& a, ncnn::Mat& a4, ncnn::Ma
                 const int packn = ncnn::cpu_riscv_vlenb() / 4;
                 if (elemcount % packn == 0)
                     any_elempack = 1;
+#elif NCNN_LASX
+                if (elemcount % 8 == 0 && ncnn::cpu_support_loongarch_lasx())
+                    any_elempack = 4;
+                else if (elemcount % 4 == 0)
+                    any_elempack = 1;
 #else
                 if (elemcount % 4 == 0)
                     any_elempack = 1;
@@ -461,9 +541,39 @@ static int convert_to_optimal_layout(const ncnn::Mat& a, ncnn::Mat& a4, ncnn::Ma
                     any_elempack = 4;
                 else if (elemcount % 4 == 0)
                     any_elempack = 1;
+#elif NCNN_AVX512
+                if (elemcount % 16 == 0 && ncnn::cpu_support_x86_avx512())
+                    any_elempack = 8;
+                else if (elemcount % 8 == 0 && ncnn::cpu_support_x86_avx())
+                    any_elempack = 4;
+                else if (elemcount % 4 == 0)
+                    any_elempack = 1;
+#elif NCNN_AVX
+                if (elemcount % 8 == 0 && ncnn::cpu_support_x86_avx())
+                    any_elempack = 4;
+                else if (elemcount % 4 == 0)
+                    any_elempack = 1;
 #elif NCNN_RVV || NCNN_XTHEADVECTOR
                 const int packn = ncnn::cpu_riscv_vlenb() / 2;
                 if (elemcount % packn == 0)
+                    any_elempack = 1;
+#elif NCNN_LASX || NCNN_LSX
+#if NCNN_LASX
+                if (elemcount % 8 == 0 && ncnn::cpu_support_loongarch_lasx())
+                    any_elempack = 4;
+                else
+#endif // NCNN_LASX
+#if NCNN_LSX
+                    if (elemcount % 8 == 0 && opt.use_bf16_storage && op->support_bf16_storage && ncnn::cpu_support_loongarch_lsx())
+                        any_elempack = 4;
+                    else
+#endif // NCNN_LSX
+                        if (elemcount % 4 == 0)
+                            any_elempack = 1;
+#elif NCNN_MSA
+                if (elemcount % 8 == 0 && opt.use_bf16_storage && op->support_bf16_storage && ncnn::cpu_support_mips_msa())
+                    any_elempack = 4;
+                else if (elemcount % 4 == 0)
                     any_elempack = 1;
 #else
                 if (elemcount % 4 == 0)
@@ -623,7 +733,7 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         delete op;
         return 233;
@@ -644,6 +754,16 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
         return -1;
     }
 
+    if (_opt.use_bf16_packed || _opt.use_bf16_storage)
+    {
+        if (op->typeindex == ncnn::LayerType::MultiHeadAttention)
+        {
+            fprintf(stderr, "fixme: skip bf16 test for MultiHeadAttention\n");
+            delete op;
+            return 233;
+        }
+    }
+
     ncnn::ModelBinFromMatArray mb(weights.data());
 
     op->load_model(mb);
@@ -652,7 +772,7 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
     opt.use_vulkan_compute = false;
 
     if (flag & TEST_LAYER_ENABLE_THREADING)
-        opt.num_threads = ncnn::get_physical_big_cpu_count();
+        opt.num_threads = std::min(ncnn::get_physical_big_cpu_count(), 4);
     else
         opt.num_threads = 1;
 
@@ -664,7 +784,7 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         op->destroy_pipeline(opt);
         delete op;
@@ -785,20 +905,10 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
 
     op->vkdev = vkdev;
 
-    ncnn::VkWeightAllocator g_weight_vkallocator(vkdev);
-    ncnn::VkWeightStagingAllocator g_weight_staging_vkallocator(vkdev);
-
-    ncnn::VkAllocator* blob_vkallocator = vkdev->acquire_blob_allocator();
-    ncnn::VkAllocator* staging_vkallocator = vkdev->acquire_staging_allocator();
-
     if (flag & TEST_LAYER_ENABLE_THREADING)
-        opt.num_threads = ncnn::get_physical_big_cpu_count();
+        opt.num_threads = std::min(ncnn::get_physical_big_cpu_count(), 4);
     else
         opt.num_threads = 1;
-
-    opt.blob_vkallocator = blob_vkallocator;
-    opt.workspace_vkallocator = blob_vkallocator;
-    opt.staging_vkallocator = staging_vkallocator;
 
     if (!vkdev->info.support_fp16_packed()) opt.use_fp16_packed = false;
     if (!vkdev->info.support_fp16_storage()) opt.use_fp16_storage = false;
@@ -816,6 +926,15 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
     // FIXME fp16a may produce large error
     opt.use_fp16_arithmetic = false;
 
+    // skip test for missed gpu capability
+    if ((_opt.use_fp16_storage && !opt.use_fp16_storage)
+            || (_opt.use_fp16_arithmetic && !opt.use_fp16_arithmetic)
+            || (_opt.use_bf16_storage && !opt.use_bf16_storage))
+    {
+        delete op;
+        return 233;
+    }
+
     if (opt.use_bf16_packed || opt.use_bf16_storage)
     {
         // winograd produce large error
@@ -824,6 +943,7 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
         if (op->typeindex == ncnn::LayerType::MultiHeadAttention)
         {
             fprintf(stderr, "fixme: skip gpu bf16 test for MultiHeadAttention\n");
+            delete op;
             return 233;
         }
     }
@@ -907,12 +1027,24 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
 
     op->load_model(mb);
 
+    ncnn::VkWeightAllocator g_weight_vkallocator(vkdev);
+    ncnn::VkWeightStagingAllocator g_weight_staging_vkallocator(vkdev);
+
+    ncnn::VkAllocator* blob_vkallocator = vkdev->acquire_blob_allocator();
+    ncnn::VkAllocator* staging_vkallocator = vkdev->acquire_staging_allocator();
+
+    opt.blob_vkallocator = blob_vkallocator;
+    opt.workspace_vkallocator = blob_vkallocator;
+    opt.staging_vkallocator = staging_vkallocator;
+
     op->create_pipeline(opt);
 
     if (!op->support_vulkan)
     {
         op->destroy_pipeline(opt);
         delete op;
+        vkdev->reclaim_blob_allocator(blob_vkallocator);
+        vkdev->reclaim_staging_allocator(staging_vkallocator);
         return 233;
     }
 
@@ -1082,6 +1214,14 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
 
 int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn::Mat>& weights, const ncnn::Option& _opt, const std::vector<ncnn::Mat>& a, int top_blob_count, const std::vector<ncnn::Mat>& top_shapes, float epsilon, int flag)
 {
+#if NCNN_VULKAN
+    if ((flag & TEST_LAYER_DISABLE_CPU_TESTING) && (flag & TEST_LAYER_DISABLE_GPU_TESTING))
+        return 0;
+#else
+    if (flag & TEST_LAYER_DISABLE_CPU_TESTING)
+        return 0;
+#endif // NCNN_VULKAN
+
     // naive
     std::vector<ncnn::Mat> b;
     {
@@ -1094,6 +1234,7 @@ int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn:
     }
 
     // cpu
+    if (!(flag & TEST_LAYER_DISABLE_CPU_TESTING))
     {
         std::vector<ncnn::Mat> c;
         int ret = test_layer_cpu(typeindex, pd, weights, _opt, a, top_blob_count, c, std::vector<ncnn::Mat>(), flag);
@@ -1105,6 +1246,7 @@ int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn:
     }
 
     // cpu shape hint
+    if (!(flag & TEST_LAYER_DISABLE_CPU_TESTING))
     {
         std::vector<ncnn::Mat> c;
         int ret = test_layer_cpu(typeindex, pd, weights, _opt, a, top_blob_count, c, b, flag);
@@ -1119,8 +1261,14 @@ int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn:
     // gpu
     if (!(flag & TEST_LAYER_DISABLE_GPU_TESTING))
     {
+        ncnn::PipelineCache* pipeline_cache = get_gpu_layer_pipeline_cache();
+
+        ncnn::Option opt = _opt;
+        opt.pipeline_cache = pipeline_cache;
+
         std::vector<ncnn::Mat> d;
-        int ret = test_layer_gpu(typeindex, pd, weights, _opt, a, top_blob_count, d, std::vector<ncnn::Mat>(), flag);
+        int ret = test_layer_gpu(typeindex, pd, weights, opt, a, top_blob_count, d, std::vector<ncnn::Mat>(), flag);
+        clear_gpu_layer_pipeline_cache_if_needed();
         if (ret != 233 && (ret != 0 || CompareMat(b, d, epsilon) != 0))
         {
             fprintf(stderr, "test_layer_gpu failed\n");
@@ -1199,7 +1347,7 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         delete op;
         return 233;
@@ -1215,6 +1363,16 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
 
     op->load_param(pd);
 
+    if (_opt.use_bf16_packed || _opt.use_bf16_storage)
+    {
+        if (op->typeindex == ncnn::LayerType::MultiHeadAttention)
+        {
+            fprintf(stderr, "fixme: skip bf16 test for MultiHeadAttention\n");
+            delete op;
+            return 233;
+        }
+    }
+
     ncnn::ModelBinFromMatArray mb(weights.data());
 
     op->load_model(mb);
@@ -1223,7 +1381,7 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
     opt.use_vulkan_compute = false;
 
     if (flag & TEST_LAYER_ENABLE_THREADING)
-        opt.num_threads = ncnn::get_physical_big_cpu_count();
+        opt.num_threads = std::min(ncnn::get_physical_big_cpu_count(), 4);
     else
         opt.num_threads = 1;
 
@@ -1235,7 +1393,7 @@ int test_layer_cpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         op->destroy_pipeline(opt);
         delete op;
@@ -1330,22 +1488,12 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
 
     op->vkdev = vkdev;
 
-    ncnn::VkWeightAllocator g_weight_vkallocator(vkdev);
-    ncnn::VkWeightStagingAllocator g_weight_staging_vkallocator(vkdev);
-
-    ncnn::VkAllocator* blob_vkallocator = vkdev->acquire_blob_allocator();
-    ncnn::VkAllocator* staging_vkallocator = vkdev->acquire_staging_allocator();
-
     opt.use_vulkan_compute = true;
 
     if (flag & TEST_LAYER_ENABLE_THREADING)
-        opt.num_threads = ncnn::get_physical_big_cpu_count();
+        opt.num_threads = std::min(ncnn::get_physical_big_cpu_count(), 4);
     else
         opt.num_threads = 1;
-
-    opt.blob_vkallocator = blob_vkallocator;
-    opt.workspace_vkallocator = blob_vkallocator;
-    opt.staging_vkallocator = staging_vkallocator;
 
     if (!vkdev->info.support_fp16_packed()) opt.use_fp16_packed = false;
     if (!vkdev->info.support_fp16_storage()) opt.use_fp16_storage = false;
@@ -1363,6 +1511,15 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
     // FIXME fp16a may produce large error
     opt.use_fp16_arithmetic = false;
 
+    // skip test for missed gpu capability
+    if ((_opt.use_fp16_storage && !opt.use_fp16_storage)
+            || (_opt.use_fp16_arithmetic && !opt.use_fp16_arithmetic)
+            || (_opt.use_bf16_storage && !opt.use_bf16_storage))
+    {
+        delete op;
+        return 233;
+    }
+
     if (opt.use_bf16_packed || opt.use_bf16_storage)
     {
         // winograd produce large error
@@ -1371,6 +1528,7 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
         if (op->typeindex == ncnn::LayerType::MultiHeadAttention)
         {
             fprintf(stderr, "fixme: skip gpu bf16 test for MultiHeadAttention\n");
+            delete op;
             return 233;
         }
     }
@@ -1447,12 +1605,24 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
 
     op->load_model(mb);
 
+    ncnn::VkWeightAllocator g_weight_vkallocator(vkdev);
+    ncnn::VkWeightStagingAllocator g_weight_staging_vkallocator(vkdev);
+
+    ncnn::VkAllocator* blob_vkallocator = vkdev->acquire_blob_allocator();
+    ncnn::VkAllocator* staging_vkallocator = vkdev->acquire_staging_allocator();
+
+    opt.blob_vkallocator = blob_vkallocator;
+    opt.workspace_vkallocator = blob_vkallocator;
+    opt.staging_vkallocator = staging_vkallocator;
+
     op->create_pipeline(opt);
 
     if (!op->support_vulkan)
     {
         op->destroy_pipeline(opt);
         delete op;
+        vkdev->reclaim_blob_allocator(blob_vkallocator);
+        vkdev->reclaim_staging_allocator(staging_vkallocator);
         return 233;
     }
 
@@ -1608,6 +1778,14 @@ int test_layer_gpu(int typeindex, const ncnn::ParamDict& pd, const std::vector<n
 
 int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn::Mat>& weights, const ncnn::Option& _opt, const ncnn::Mat& a, const ncnn::Mat& top_shape, float epsilon, int flag)
 {
+#if NCNN_VULKAN
+    if ((flag & TEST_LAYER_DISABLE_CPU_TESTING) && (flag & TEST_LAYER_DISABLE_GPU_TESTING))
+        return 0;
+#else
+    if (flag & TEST_LAYER_DISABLE_CPU_TESTING)
+        return 0;
+#endif // NCNN_VULKAN
+
     // naive
     ncnn::Mat b;
     {
@@ -1620,6 +1798,7 @@ int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn:
     }
 
     // cpu
+    if (!(flag & TEST_LAYER_DISABLE_CPU_TESTING))
     {
         ncnn::Mat c;
         int ret = test_layer_cpu(typeindex, pd, weights, _opt, a, c, ncnn::Mat(), flag);
@@ -1631,6 +1810,7 @@ int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn:
     }
 
     // cpu shape hint
+    if (!(flag & TEST_LAYER_DISABLE_CPU_TESTING))
     {
         ncnn::Mat c;
         int ret = test_layer_cpu(typeindex, pd, weights, _opt, a, c, b, flag);
@@ -1645,8 +1825,14 @@ int test_layer(int typeindex, const ncnn::ParamDict& pd, const std::vector<ncnn:
     // gpu
     if (!(flag & TEST_LAYER_DISABLE_GPU_TESTING))
     {
+        ncnn::PipelineCache* pipeline_cache = get_gpu_layer_pipeline_cache();
+
+        ncnn::Option opt = _opt;
+        opt.pipeline_cache = pipeline_cache;
+
         ncnn::Mat d;
-        int ret = test_layer_gpu(typeindex, pd, weights, _opt, a, d, ncnn::Mat(), flag);
+        int ret = test_layer_gpu(typeindex, pd, weights, opt, a, d, ncnn::Mat(), flag);
+        clear_gpu_layer_pipeline_cache_if_needed();
         if (ret != 233 && (ret != 0 || CompareMat(b, d, epsilon) != 0))
         {
             fprintf(stderr, "test_layer_gpu failed\n");
@@ -1844,18 +2030,21 @@ int test_layer_opt(const char* layer_type, const ncnn::ParamDict& pd, const std:
 
 int test_layer(const char* layer_type, const ncnn::ParamDict& pd, const std::vector<ncnn::Mat>& weights, const std::vector<ncnn::Mat>& a, int top_blob_count, float epsilon, int flag)
 {
-    // pack fp16p fp16s fp16a bf16p/bf16s
-    const int options[][5] = {
-        {0, 0, 0, 0, 0},
-        {0, 1, 0, 0, 0},
-        {0, 1, 0, 1, 0},
-        {0, 0, 1, 1, 0},
-        {0, 0, 0, 0, 1},
-        {1, 0, 0, 0, 0},
-        {1, 1, 0, 0, 0},
-        {1, 1, 0, 1, 0},
-        {1, 0, 1, 1, 0},
-        {1, 0, 0, 0, 1},
+    // pack fp16p fp16s fp16a bf16p bf16s flag
+    const int options[][7] = {
+        {0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 1, 1, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 0},
+        {1, 0, 0, 0, 0, 0, 0},
+#if NCNN_VULKAN
+        {1, 1, 0, 0, 0, 0, TEST_LAYER_DISABLE_CPU_TESTING},
+        {1, 1, 0, 1, 0, 0, TEST_LAYER_DISABLE_CPU_TESTING},
+        {1, 0, 0, 0, 1, 0, TEST_LAYER_DISABLE_CPU_TESTING},
+#endif // NCNN_VULKAN
+        {1, 0, 1, 0, 0, 0, 0},
+        {1, 0, 1, 1, 0, 0, 0},
+        {1, 0, 0, 0, 0, 1, 0},
     };
 
     const int opt_count = sizeof(options) / sizeof(options[0]);
@@ -1869,9 +2058,9 @@ int test_layer(const char* layer_type, const ncnn::ParamDict& pd, const std::vec
         opt.use_fp16_storage = options[i][2];
         opt.use_fp16_arithmetic = options[i][3];
         opt.use_bf16_packed = options[i][4];
-        opt.use_bf16_storage = options[i][4];
+        opt.use_bf16_storage = options[i][5];
 
-        int ret = test_layer_opt(layer_type, pd, weights, opt, a, top_blob_count, epsilon, flag);
+        int ret = test_layer_opt(layer_type, pd, weights, opt, a, top_blob_count, epsilon, flag | options[i][6]);
         if (ret != 0)
             return ret;
     }
@@ -1881,18 +2070,21 @@ int test_layer(const char* layer_type, const ncnn::ParamDict& pd, const std::vec
 
 int test_layer(const char* layer_type, const ncnn::ParamDict& pd, const std::vector<ncnn::Mat>& weights, const ncnn::Mat& a, float epsilon, int flag)
 {
-    // pack fp16p fp16s fp16a bf16p/bf16s
-    const int options[][5] = {
-        {0, 0, 0, 0, 0},
-        {0, 1, 0, 0, 0},
-        {0, 1, 0, 1, 0},
-        {0, 0, 1, 1, 0},
-        {0, 0, 0, 0, 1},
-        {1, 0, 0, 0, 0},
-        {1, 1, 0, 0, 0},
-        {1, 1, 0, 1, 0},
-        {1, 0, 1, 1, 0},
-        {1, 0, 0, 0, 1},
+    // pack fp16p fp16s fp16a bf16p bf16s flag
+    const int options[][7] = {
+        {0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 1, 1, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 0},
+        {1, 0, 0, 0, 0, 0, 0},
+#if NCNN_VULKAN
+        {1, 1, 0, 0, 0, 0, TEST_LAYER_DISABLE_CPU_TESTING},
+        {1, 1, 0, 1, 0, 0, TEST_LAYER_DISABLE_CPU_TESTING},
+        {1, 0, 0, 0, 1, 0, TEST_LAYER_DISABLE_CPU_TESTING},
+#endif // NCNN_VULKAN
+        {1, 0, 1, 0, 0, 0, 0},
+        {1, 0, 1, 1, 0, 0, 0},
+        {1, 0, 0, 0, 0, 1, 0},
     };
 
     const int opt_count = sizeof(options) / sizeof(options[0]);
@@ -1906,9 +2098,9 @@ int test_layer(const char* layer_type, const ncnn::ParamDict& pd, const std::vec
         opt.use_fp16_storage = options[i][2];
         opt.use_fp16_arithmetic = options[i][3];
         opt.use_bf16_packed = options[i][4];
-        opt.use_bf16_storage = options[i][4];
+        opt.use_bf16_storage = options[i][5];
 
-        int ret = test_layer_opt(layer_type, pd, weights, opt, a, epsilon, flag);
+        int ret = test_layer_opt(layer_type, pd, weights, opt, a, epsilon, flag | options[i][6]);
         if (ret != 0)
             return ret;
     }
@@ -1976,7 +2168,7 @@ int test_layer_oom_opt(const char* layer_type, const ncnn::ParamDict& pd, const 
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         delete op;
         return 233;
@@ -1999,7 +2191,7 @@ int test_layer_oom_opt(const char* layer_type, const ncnn::ParamDict& pd, const 
     opt.use_vulkan_compute = false;
 
     if (flag & TEST_LAYER_ENABLE_THREADING)
-        opt.num_threads = ncnn::get_physical_big_cpu_count();
+        opt.num_threads = std::min(ncnn::get_physical_big_cpu_count(), 4);
     else
         opt.num_threads = 1;
 
@@ -2011,7 +2203,7 @@ int test_layer_oom_opt(const char* layer_type, const ncnn::ParamDict& pd, const 
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         op->destroy_pipeline(opt);
         delete op;
@@ -2161,7 +2353,7 @@ int test_layer_oom_opt(const char* layer_type, const ncnn::ParamDict& pd, const 
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         delete op;
         return 233;
@@ -2177,7 +2369,7 @@ int test_layer_oom_opt(const char* layer_type, const ncnn::ParamDict& pd, const 
     opt.use_vulkan_compute = false;
 
     if (flag & TEST_LAYER_ENABLE_THREADING)
-        opt.num_threads = ncnn::get_physical_big_cpu_count();
+        opt.num_threads = std::min(ncnn::get_physical_big_cpu_count(), 4);
     else
         opt.num_threads = 1;
 
@@ -2189,7 +2381,7 @@ int test_layer_oom_opt(const char* layer_type, const ncnn::ParamDict& pd, const 
         delete op;
         return 233;
     }
-    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_arithmetic))
+    if (!op->support_bf16_storage && !op->support_fp16_storage && (_opt.use_bf16_storage || _opt.use_fp16_storage || _opt.use_fp16_arithmetic))
     {
         op->destroy_pipeline(opt);
         delete op;
@@ -2291,16 +2483,14 @@ int test_layer_oom_opt(const char* layer_type, const ncnn::ParamDict& pd, const 
 
 int test_layer_oom(const char* layer_type, const ncnn::ParamDict& pd, const std::vector<ncnn::Mat>& weights, const std::vector<ncnn::Mat>& a, int top_blob_count, int flag)
 {
-    // pack fp16p fp16s fp16a bf16s
+    // pack fp16p fp16s fp16a bf16p/bf16s
     const int options[][5] = {
         {0, 0, 0, 0, 0},
-        {0, 1, 0, 0, 0},
-        {0, 1, 0, 1, 0},
+        {0, 0, 1, 0, 0},
         {0, 0, 1, 1, 0},
         {0, 0, 0, 0, 1},
         {1, 0, 0, 0, 0},
-        {1, 1, 0, 0, 0},
-        {1, 1, 0, 1, 0},
+        {1, 0, 1, 0, 0},
         {1, 0, 1, 1, 0},
         {1, 0, 0, 0, 1},
     };
@@ -2328,16 +2518,14 @@ int test_layer_oom(const char* layer_type, const ncnn::ParamDict& pd, const std:
 
 int test_layer_oom(const char* layer_type, const ncnn::ParamDict& pd, const std::vector<ncnn::Mat>& weights, const ncnn::Mat& a, int flag)
 {
-    // pack fp16p fp16s fp16a bf16s
+    // pack fp16p fp16s fp16a bf16p/bf16s
     const int options[][5] = {
         {0, 0, 0, 0, 0},
-        {0, 1, 0, 0, 0},
-        {0, 1, 0, 1, 0},
+        {0, 0, 1, 0, 0},
         {0, 0, 1, 1, 0},
         {0, 0, 0, 0, 1},
         {1, 0, 0, 0, 0},
-        {1, 1, 0, 0, 0},
-        {1, 1, 0, 1, 0},
+        {1, 0, 1, 0, 0},
         {1, 0, 1, 1, 0},
         {1, 0, 0, 0, 1},
     };
